@@ -1,0 +1,28 @@
+{
+  "name": "@dt/worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Kafka telemetry consumer — validation, anomaly detection, TimescaleDB writes, live-state fan-out, IFC parsing",
+  "main": "./dist/main.js",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@dt/common": "workspace:*",
+    "@dt/contracts": "workspace:*",
+    "@dt/db": "workspace:*",
+    "ioredis": "^5.4.1",
+    "kafkajs": "^2.2.4",
+    "web-ifc": "0.0.66",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "typescript": "~5.6.3",
+    "vitest": "^2.1.5"
+  }
+}

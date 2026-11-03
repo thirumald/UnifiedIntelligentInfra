@@ -1,0 +1,14 @@
+# Topic contract:  dt/v1/{tenantId}/{deviceId}/telemetry
+#                  dt/v1/{tenantId}/{deviceId}/status
+#                  dt/v1/{tenantId}/{deviceId}/cmd        (platform → device)
+
+# Platform service account (ingest-bridge, simulator, health checks)
+user dt-service
+topic readwrite dt/v1/#
+topic read $SYS/#
+
+# Shared device / OT-gateway account — publish telemetry & status, receive commands
+user dt-device
+topic write dt/v1/+/+/telemetry
+topic write dt/v1/+/+/status
+topic read  dt/v1/+/+/cmd

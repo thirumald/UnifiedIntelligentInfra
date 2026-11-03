@@ -1,0 +1,9 @@
+{
+  "version": 8,
+  "name": "dt-offline-dark",
+  "metadata": { "description": "Zero-dependency basemap for air-gapped / sovereign deployments. Replace with a self-hosted vector-tile style when available." },
+  "sources": {},
+  "layers": [
+    { "id": "background", "type": "background", "paint": { "background-color": "#0e1726" } }
+  ]
+}

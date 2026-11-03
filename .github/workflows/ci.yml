@@ -1,0 +1,90 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Typecheck · build · unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm typecheck
+      - run: pnpm test
+
+  migrations:
+    name: PostGIS migrations + seed
+    runs-on: ubuntu-latest
+    services:
+      postgis:
+        image: postgis/postgis:16-3.5
+        env:
+          POSTGRES_DB: dt_assets
+          POSTGRES_USER: dt_assets
+          POSTGRES_PASSWORD: ci
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U dt_assets" --health-interval 5s --health-timeout 5s --health-retries 20
+      timescaledb:
+        image: timescale/timescaledb:2.17.2-pg16
+        env:
+          POSTGRES_DB: dt_telemetry
+          POSTGRES_USER: dt_telemetry
+          POSTGRES_PASSWORD: ci
+        ports: ['5433:5432']
+        options: >-
+          --health-cmd "pg_isready -U dt_telemetry" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @dt/migrator... build
+      - name: Apply migrations twice (second run must be a no-op)
+        env:
+          POSTGIS_HOST: localhost
+          POSTGIS_PORT: 5432
+          POSTGIS_PASSWORD: ci
+          TSDB_HOST: localhost
+          TSDB_PORT: 5433
+          TSDB_PASSWORD: ci
+        run: |
+          node apps/migrator/dist/main.js
+          node apps/migrator/dist/main.js
+
+  compose-and-images:
+    name: Compose config + container images
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [api, worker, ingest-bridge, simulator, migrator, gateway-provisioner]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate docker-compose.yml
+        run: cp .env.example .env && docker compose config -q
+      - name: Build ${{ matrix.app }} image
+        run: docker build --build-arg APP=${{ matrix.app }} -f infra/docker/node-service.Dockerfile -t dt-platform/${{ matrix.app }}:ci .
+
+  web-image:
+    name: Web image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f infra/docker/web.Dockerfile -t dt-platform/web:ci .

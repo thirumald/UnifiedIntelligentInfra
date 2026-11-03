@@ -1,0 +1,525 @@
+# =============================================================================
+#  Enterprise Digital Twin & Infrastructure Management Platform
+#  docker-compose.yml — full local / single-node orchestration
+#
+#  Topology
+#    field devices ──MQTT──► mosquitto ──► ingest-bridge ──► kafka (dt.telemetry.raw)
+#                                                              │
+#                                     telemetry-worker ◄───────┘
+#                                       │  ├─► timescaledb   (hypertables)
+#                                       │  ├─► kafka         (dt.telemetry.anomalies)
+#                                       │  └─► redis pub/sub (dt:state:*)
+#                                       ▼
+#    web (Next.js) ──WS / REST──► gravitee-gateway ──► api (NestJS) ──► postgis (assets, GeoJSON, IFC GUIDs)
+#                                  (plans, JWT,          ▲  │            └─► timescaledb (history queries)
+#                                   rate limits)          │  └─ subscribes redis dt:state:* → socket.io push
+#                                                         └── gravitee-management-api / console / portal
+#
+#  Start-up order
+#    postgis/timescaledb → migrate (one-shot) → api/worker/ingest-bridge
+#    kafka → kafka-init (one-shot topics)     → api/worker/ingest-bridge
+#    gravitee-* → gateway-provisioner (one-shot API import/deploy) → web
+#
+#  Usage
+#    cp .env.example .env               # then set every CHANGE_ME value
+#    docker compose up -d --build       # core platform
+#    docker compose --profile sim up -d # + IoT device simulator
+#    docker compose --profile tools up -d kafka-ui
+# =============================================================================
+
+name: dt-platform
+
+# ---------------------------------------------------------------------------
+# Shared fragments
+# ---------------------------------------------------------------------------
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-restart: &restart-policy
+  restart: unless-stopped
+
+x-node-service: &node-service
+  <<: *restart-policy
+  logging: *default-logging
+  build: &node-build
+    context: .
+    dockerfile: infra/docker/node-service.Dockerfile
+  env_file: .env
+  networks: [backend]
+  security_opt: ["no-new-privileges:true"]
+  read_only: true
+  tmpfs: ["/tmp"]
+
+services:
+  # =========================================================================
+  #  DATA LAYER — polyglot persistence
+  # =========================================================================
+
+  # PostgreSQL 16 + PostGIS 3.5 — asset registry, spatial queries, BIM metadata
+  postgis:
+    image: postgis/postgis:16-3.5
+    <<: *restart-policy
+    logging: *default-logging
+    environment:
+      POSTGRES_DB: ${POSTGIS_DB}
+      POSTGRES_USER: ${POSTGIS_USER}
+      POSTGRES_PASSWORD: ${POSTGIS_PASSWORD:?POSTGIS_PASSWORD must be set}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command: >
+      postgres
+        -c shared_buffers=${POSTGIS_SHARED_BUFFERS:-512MB}
+        -c effective_cache_size=${POSTGIS_EFFECTIVE_CACHE:-1536MB}
+        -c work_mem=16MB
+        -c maintenance_work_mem=256MB
+        -c max_connections=200
+        -c random_page_cost=1.1
+        -c log_min_duration_statement=500
+    volumes:
+      - postgis-data:/var/lib/postgresql/data
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${POSTGIS_HOST_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [backend]
+    deploy:
+      resources:
+        limits: { memory: 2g }
+
+  # PostgreSQL 16 + TimescaleDB 2.17 — high-frequency OT/IoT telemetry
+  timescaledb:
+    image: timescale/timescaledb:2.17.2-pg16
+    <<: *restart-policy
+    logging: *default-logging
+    environment:
+      POSTGRES_DB: ${TSDB_DB}
+      POSTGRES_USER: ${TSDB_USER}
+      POSTGRES_PASSWORD: ${TSDB_PASSWORD:?TSDB_PASSWORD must be set}
+      PGDATA: /var/lib/postgresql/data/pgdata
+      TS_TUNE_MEMORY: ${TSDB_TUNE_MEMORY:-2GB}
+      TS_TUNE_NUM_CPUS: ${TSDB_TUNE_CPUS:-2}
+      TIMESCALEDB_TELEMETRY: "off"
+    volumes:
+      - tsdb-data:/var/lib/postgresql/data
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${TSDB_HOST_PORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks: [backend]
+    deploy:
+      resources:
+        limits: { memory: 3g }
+
+  # =========================================================================
+  #  STREAMING LAYER
+  # =========================================================================
+
+  # Apache Kafka 3.8 in KRaft mode (no ZooKeeper — removed upstream in Kafka 4.x)
+  kafka:
+    image: apache/kafka:3.8.1
+    <<: *restart-policy
+    logging: *default-logging
+    hostname: kafka
+    environment:
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:?KAFKA_CLUSTER_ID must be set}
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # INTERNAL → other containers; EXTERNAL → tools on the host
+      KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://${KAFKA_EXTERNAL_HOST:-localhost}:${KAFKA_HOST_PORT:-9092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # Single-node replication settings (raise to 3 on a real cluster)
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics are declared explicitly by kafka-init — never implicitly
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: 6
+      KAFKA_LOG_RETENTION_HOURS: 72
+      KAFKA_MESSAGE_MAX_BYTES: 2097152
+      KAFKA_HEAP_OPTS: ${KAFKA_HEAP_OPTS:--Xms512m -Xmx1g}
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${KAFKA_HOST_PORT:-9092}:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:29092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    networks: [backend]
+    deploy:
+      resources:
+        limits: { memory: 1536m }
+
+  # One-shot: declares topics with explicit partitions / retention, then exits 0
+  kafka-init:
+    image: apache/kafka:3.8.1
+    logging: *default-logging
+    depends_on:
+      kafka: { condition: service_healthy }
+    env_file: .env
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+    entrypoint: ["/bin/bash", "/scripts/create-topics.sh"]
+    volumes:
+      - ./infra/kafka/create-topics.sh:/scripts/create-topics.sh:ro
+    restart: "no"
+    networks: [backend]
+
+  # Eclipse Mosquitto 2 — MQTT ingress for field / OT gateways
+  mosquitto:
+    image: eclipse-mosquitto:2.0.20
+    <<: *restart-policy
+    logging: *default-logging
+    environment:
+      MQTT_SERVICE_USERNAME: ${MQTT_SERVICE_USERNAME}
+      MQTT_SERVICE_PASSWORD: ${MQTT_SERVICE_PASSWORD:?MQTT_SERVICE_PASSWORD must be set}
+      MQTT_DEVICE_USERNAME: ${MQTT_DEVICE_USERNAME}
+      MQTT_DEVICE_PASSWORD: ${MQTT_DEVICE_PASSWORD:?MQTT_DEVICE_PASSWORD must be set}
+    # Credentials are materialised from env at start — no secrets baked into the repo
+    entrypoint: ["/bin/sh", "/mosquitto/config/entrypoint.sh"]
+    volumes:
+      - ./infra/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./infra/mosquitto/acl:/mosquitto/config/acl:ro
+      - ./infra/mosquitto/entrypoint.sh:/mosquitto/config/entrypoint.sh:ro
+      - mosquitto-data:/mosquitto/data
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${MQTT_HOST_PORT:-1883}:1883"
+      - "${BIND_ADDR:-127.0.0.1}:${MQTT_WS_HOST_PORT:-9001}:9001"
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -h localhost -u \"$${MQTT_SERVICE_USERNAME}\" -P \"$${MQTT_SERVICE_PASSWORD}\" -t '$$SYS/broker/uptime' -C 1 -W 5 > /dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 6
+      start_period: 10s
+    networks: [backend]
+
+  # Redis 7 — WebSocket fan-out (socket.io adapter) + live-state cache
+  redis:
+    image: redis:7.4-alpine
+    <<: *restart-policy
+    logging: *default-logging
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+    command: >
+      sh -c 'exec redis-server
+        --requirepass "$$REDIS_PASSWORD"
+        --appendonly yes
+        --maxmemory ${REDIS_MAXMEMORY:-512mb}
+        --maxmemory-policy allkeys-lru'
+    volumes:
+      - redis-data:/data
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [backend]
+
+  # =========================================================================
+  #  APPLICATION LAYER
+  # =========================================================================
+
+  # One-shot: versioned SQL migrations for both stores (+ demo seed), then exits 0
+  migrate:
+    <<: *node-service
+    restart: "no"
+    build:
+      <<: *node-build
+      args: { APP: migrator }
+    image: dt-platform/migrator:${IMAGE_TAG:-latest}
+    depends_on:
+      postgis: { condition: service_healthy }
+      timescaledb: { condition: service_healthy }
+    environment:
+      SERVICE_NAME: migrator
+
+  # NestJS — REST (GeoJSON) + socket.io gateway; stateless, horizontally scalable
+  api:
+    <<: *node-service
+    build:
+      <<: *node-build
+      args: { APP: api }
+    image: dt-platform/api:${IMAGE_TAG:-latest}
+    depends_on:
+      postgis: { condition: service_healthy }
+      timescaledb: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+      migrate: { condition: service_completed_successfully }
+    environment:
+      SERVICE_NAME: api
+      PORT: 4000
+    volumes:
+      - ifc-data:/data/ifc
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${API_HOST_PORT:-4000}:4000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/health/live').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks: [backend, frontend]
+
+  # Kafka consumer — validation, anomaly detection, Timescale batch writes
+  worker:
+    <<: *node-service
+    build:
+      <<: *node-build
+      args: { APP: worker }
+    image: dt-platform/worker:${IMAGE_TAG:-latest}
+    depends_on:
+      timescaledb: { condition: service_healthy }
+      postgis: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+      migrate: { condition: service_completed_successfully }
+    environment:
+      SERVICE_NAME: worker
+    volumes:
+      - ifc-data:/data/ifc:ro
+    deploy:
+      # Scale up to the dt.telemetry.raw partition count (same consumer group)
+      replicas: ${WORKER_REPLICAS:-2}
+      resources:
+        limits: { memory: 512m }
+
+  # MQTT → Kafka bridge — keyed by deviceId to preserve per-device ordering
+  ingest-bridge:
+    <<: *node-service
+    build:
+      <<: *node-build
+      args: { APP: ingest-bridge }
+    image: dt-platform/ingest-bridge:${IMAGE_TAG:-latest}
+    depends_on:
+      mosquitto: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+      migrate: { condition: service_completed_successfully }
+    environment:
+      SERVICE_NAME: ingest-bridge
+
+  # Simulated HVAC / rack-PDU / SCADA devices publishing over MQTT
+  simulator:
+    <<: *node-service
+    profiles: ["sim"]
+    build:
+      <<: *node-build
+      args: { APP: simulator }
+    image: dt-platform/simulator:${IMAGE_TAG:-latest}
+    depends_on:
+      mosquitto: { condition: service_healthy }
+      api: { condition: service_healthy }
+    environment:
+      SERVICE_NAME: simulator
+
+  # Next.js spatial UI (MapLibre/deck.gl GIS + Three.js BIM viewport)
+  web:
+    <<: *restart-policy
+    logging: *default-logging
+    build:
+      context: .
+      dockerfile: infra/docker/web.Dockerfile
+      args:
+        # NEXT_PUBLIC_* are inlined into the browser bundle at build time
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL}
+        NEXT_PUBLIC_MAP_STYLE_URL: ${NEXT_PUBLIC_MAP_STYLE_URL}
+        NEXT_PUBLIC_MAP_CENTER: ${NEXT_PUBLIC_MAP_CENTER}
+    image: dt-platform/web:${IMAGE_TAG:-latest}
+    depends_on:
+      api: { condition: service_healthy }
+      gravitee-gateway: { condition: service_started }
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HOSTNAME: 0.0.0.0
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${WEB_HOST_PORT:-3000}:3000"
+    security_opt: ["no-new-privileges:true"]
+    networks: [frontend]
+
+  # =========================================================================
+  #  API GATEWAY LAYER — Gravitee APIM 4.x (OSS edition)
+  #  Single policy-enforcement point in front of the NestJS API:
+  #  REST (GeoJSON) and socket.io/WebSocket traffic both pass through the
+  #  gateway (JWT/API-key plans, rate limiting, analytics, dev portal).
+  #  API definitions are imported via the Management API in Phase 3.
+  # =========================================================================
+
+  # Gravitee config store (APIs, plans, subscriptions, rate-limit counters)
+  gravitee-mongodb:
+    image: mongo:7.0
+    <<: *restart-policy
+    logging: *default-logging
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${GRAVITEE_MONGO_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${GRAVITEE_MONGO_PASSWORD:?GRAVITEE_MONGO_PASSWORD must be set}
+      MONGO_INITDB_DATABASE: gravitee
+    volumes:
+      - gravitee-mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [backend]
+
+  # Gravitee analytics / request logs
+  gravitee-elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${GRAVITEE_ES_VERSION:-8.15.3}
+    <<: *restart-policy
+    logging: *default-logging
+    environment:
+      discovery.type: single-node
+      cluster.name: gravitee-analytics
+      xpack.security.enabled: "false"   # network-isolated on dt-backend; enable TLS+auth for prod
+      http.host: 0.0.0.0
+      ES_JAVA_OPTS: ${GRAVITEE_ES_JAVA_OPTS:--Xms512m -Xmx512m}
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    volumes:
+      - gravitee-es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health?wait_for_status=yellow\\&timeout=5s > /dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 40s
+    networks: [backend]
+    deploy:
+      resources:
+        limits: { memory: 1536m }
+
+  # Data plane — the only public entrypoint for API + WebSocket traffic
+  gravitee-gateway:
+    image: graviteeio/apim-gateway:${GRAVITEE_VERSION:-4.11}
+    <<: *restart-policy
+    logging: *default-logging
+    depends_on:
+      gravitee-mongodb: { condition: service_healthy }
+      gravitee-elasticsearch: { condition: service_healthy }
+    environment:
+      gravitee_management_type: mongodb
+      gravitee_management_mongodb_uri: mongodb://${GRAVITEE_MONGO_USER}:${GRAVITEE_MONGO_PASSWORD}@gravitee-mongodb:27017/gravitee?authSource=admin&serverSelectionTimeoutMS=5000&connectTimeoutMS=5000
+      gravitee_ratelimit_type: mongodb
+      gravitee_ratelimit_mongodb_uri: mongodb://${GRAVITEE_MONGO_USER}:${GRAVITEE_MONGO_PASSWORD}@gravitee-mongodb:27017/gravitee?authSource=admin&serverSelectionTimeoutMS=5000&connectTimeoutMS=5000
+      gravitee_reporters_elasticsearch_endpoints_0: http://gravitee-elasticsearch:9200
+      gravitee_http_cors_enabled: "true"
+      JAVA_OPTS: ${GRAVITEE_GATEWAY_JAVA_OPTS:--Xms256m -Xmx512m}
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${GATEWAY_HOST_PORT:-8082}:8082"
+    networks: [backend, frontend]
+
+  # Control plane — REST API used by Console, Portal and our provisioning script
+  gravitee-management-api:
+    image: graviteeio/apim-management-api:${GRAVITEE_VERSION:-4.11}
+    <<: *restart-policy
+    logging: *default-logging
+    depends_on:
+      gravitee-mongodb: { condition: service_healthy }
+      gravitee-elasticsearch: { condition: service_healthy }
+    environment:
+      gravitee_management_type: mongodb
+      gravitee_management_mongodb_uri: mongodb://${GRAVITEE_MONGO_USER}:${GRAVITEE_MONGO_PASSWORD}@gravitee-mongodb:27017/gravitee?authSource=admin&serverSelectionTimeoutMS=5000&connectTimeoutMS=5000
+      gravitee_analytics_elasticsearch_endpoints_0: http://gravitee-elasticsearch:9200
+      gravitee_installation_type: standalone
+      gravitee_installation_standalone_console_urls_0_orgId: DEFAULT
+      gravitee_installation_standalone_console_urls_0_url: ${GRAVITEE_CONSOLE_PUBLIC_URL:-http://localhost:8084}
+      gravitee_installation_standalone_portal_urls_0_envId: DEFAULT
+      gravitee_installation_standalone_portal_urls_0_url: ${GRAVITEE_PORTAL_PUBLIC_URL:-http://localhost:8085}
+      gravitee_jwt_secret: ${GRAVITEE_JWT_SECRET:?GRAVITEE_JWT_SECRET must be set}
+      JAVA_OPTS: ${GRAVITEE_MGMT_JAVA_OPTS:--Xms256m -Xmx768m}
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${GRAVITEE_MGMT_HOST_PORT:-8083}:8083"
+    networks: [backend]
+
+  gravitee-console:
+    image: graviteeio/apim-management-ui:${GRAVITEE_VERSION:-4.11}
+    <<: *restart-policy
+    logging: *default-logging
+    depends_on: [gravitee-management-api]
+    environment:
+      MGMT_API_URL: ${GRAVITEE_MGMT_PUBLIC_URL:-http://localhost:8083}/management/organizations/DEFAULT/environments/DEFAULT/
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${GRAVITEE_CONSOLE_HOST_PORT:-8084}:8080"
+    networks: [backend]
+
+  gravitee-portal:
+    image: graviteeio/apim-portal-ui:${GRAVITEE_VERSION:-4.11}
+    <<: *restart-policy
+    logging: *default-logging
+    depends_on: [gravitee-management-api]
+    environment:
+      PORTAL_API_URL: ${GRAVITEE_MGMT_PUBLIC_URL:-http://localhost:8083}/portal/environments/DEFAULT
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${GRAVITEE_PORTAL_HOST_PORT:-8085}:8080"
+    networks: [backend]
+
+  # One-shot: imports, starts and deploys the dt-platform APIs on the gateway
+  gateway-provisioner:
+    <<: *node-service
+    restart: on-failure:5
+    build:
+      <<: *node-build
+      args: { APP: gateway-provisioner }
+    image: dt-platform/gateway-provisioner:${IMAGE_TAG:-latest}
+    depends_on:
+      gravitee-management-api: { condition: service_started }
+      api: { condition: service_healthy }
+    environment:
+      SERVICE_NAME: gateway-provisioner
+
+  # =========================================================================
+  #  OPERATOR TOOLS (opt-in)
+  # =========================================================================
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    profiles: ["tools"]
+    logging: *default-logging
+    depends_on:
+      kafka: { condition: service_healthy }
+    environment:
+      KAFKA_CLUSTERS_0_NAME: dt-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      DYNAMIC_CONFIG_ENABLED: "false"
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${KAFKA_UI_HOST_PORT:-8080}:8080"
+    networks: [backend]
+
+networks:
+  backend:
+    name: dt-backend
+  frontend:
+    name: dt-frontend
+
+volumes:
+  postgis-data:
+  tsdb-data:
+  kafka-data:
+  mosquitto-data:
+  redis-data:
+  gravitee-mongo-data:
+  gravitee-es-data:
+  ifc-data:

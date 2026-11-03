@@ -1,0 +1,123 @@
+{
+  "api": {
+    "definitionVersion": "V4",
+    "type": "PROXY",
+    "name": "dt-platform-realtime",
+    "apiVersion": "1.0.0",
+    "description": "Digital Twin realtime channel (socket.io: WebSocket with long-polling fallback).",
+    "tags": [],
+    "labels": [
+      "dt-platform",
+      "digital-twin"
+    ],
+    "listeners": [
+      {
+        "type": "HTTP",
+        "paths": [
+          {
+            "path": "{{GATEWAY_WS_CONTEXT}}/"
+          }
+        ],
+        "entrypoints": [
+          {
+            "type": "http-proxy",
+            "qos": "AUTO"
+          }
+        ]
+      }
+    ],
+    "endpointGroups": [
+      {
+        "name": "dt-api",
+        "type": "http-proxy",
+        "loadBalancer": {
+          "type": "ROUND_ROBIN"
+        },
+        "sharedConfiguration": {
+          "http": {
+            "version": "HTTP_1_1",
+            "connectTimeout": 5000,
+            "readTimeout": 60000,
+            "idleTimeout": 60000,
+            "keepAlive": true,
+            "followRedirects": false,
+            "useCompression": false,
+            "propagateClientAcceptEncoding": true,
+            "maxConcurrentConnections": 200
+          }
+        },
+        "endpoints": [
+          {
+            "name": "api",
+            "type": "http-proxy",
+            "weight": 1,
+            "inheritConfiguration": true,
+            "configuration": {
+              "target": "{{API_UPSTREAM_URL}}/realtime"
+            }
+          }
+        ]
+      }
+    ],
+    "analytics": {
+      "enabled": true
+    },
+    "flowExecution": {
+      "mode": "DEFAULT",
+      "matchRequired": false
+    },
+    "flows": [],
+    "visibility": "PRIVATE"
+  },
+  "plans": [
+    {
+      "definitionVersion": "V4",
+      "name": "Platform (keyless + rate limit)",
+      "description": "Identity is enforced by the platform JWT at the API; the gateway applies throttling and analytics.",
+      "security": {
+        "type": "KEY_LESS"
+      },
+      "mode": "STANDARD",
+      "validation": "AUTO",
+      "status": "PUBLISHED",
+      "type": "API",
+      "flows": [
+        {
+          "name": "throttle",
+          "enabled": true,
+          "selectors": [
+            {
+              "type": "HTTP",
+              "path": "/",
+              "pathOperator": "STARTS_WITH"
+            }
+          ],
+          "request": [
+            {
+              "name": "Rate limit",
+              "enabled": true,
+              "policy": "rate-limit",
+              "configuration": {
+                "async": false,
+                "addHeaders": true,
+                "rate": {
+                  "useKeySpEL": false,
+                  "periodTime": 1,
+                  "limit": 6000,
+                  "periodTimeUnit": "MINUTES",
+                  "key": ""
+                }
+              }
+            }
+          ],
+          "response": [],
+          "subscribe": [],
+          "publish": []
+        }
+      ]
+    }
+  ],
+  "metadata": [],
+  "pages": [],
+  "members": []
+}

@@ -1,0 +1,26 @@
+{
+  "name": "dt-platform",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Enterprise Digital Twin & Infrastructure Management Platform",
+  "packageManager": "pnpm@9.15.0",
+  "engines": {
+    "node": ">=22.11.0"
+  },
+  "scripts": {
+    "build": "pnpm -r run build",
+    "typecheck": "pnpm -r run typecheck",
+    "test": "pnpm -r --if-present run test",
+    "migrate": "pnpm --filter @dt/migrator start",
+    "dev:infra": "docker compose up -d postgis timescaledb kafka kafka-init mosquitto redis",
+    "up": "docker compose up -d --build",
+    "up:sim": "docker compose --profile sim up -d --build",
+    "down": "docker compose down",
+    "nuke": "docker compose down -v --remove-orphans",
+    "seed:regen": "python3 scripts/gen-seed.py"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "typescript": "~5.6.3"
+  }
+}

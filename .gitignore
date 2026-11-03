@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.next/
+out/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+coverage/
+.DS_Store
+infra/gravitee/license.key
+.next/
+apps/web/public/wasm/
+next-env.d.ts.bak
+dump.rdb

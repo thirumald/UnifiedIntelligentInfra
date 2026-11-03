@@ -1,0 +1,35 @@
+{
+  "name": "@dt/web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Spatial digital-twin console — MapLibre/deck.gl GIS + Three.js/web-ifc BIM with live telemetry",
+  "scripts": {
+    "prebuild": "node scripts/copy-wasm.mjs",
+    "predev": "node scripts/copy-wasm.mjs",
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@deck.gl/core": "^9.0.38",
+    "@deck.gl/layers": "^9.0.38",
+    "@deck.gl/mapbox": "^9.0.38",
+    "@dt/contracts": "workspace:*",
+    "maplibre-gl": "^4.7.1",
+    "next": "^15.1.6",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "socket.io-client": "^4.8.1",
+    "three": "^0.171.0",
+    "web-ifc": "0.0.66",
+    "zustand": "^5.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "@types/react": "^19.0.7",
+    "@types/react-dom": "^19.0.3",
+    "@types/three": "^0.171.0",
+    "typescript": "~5.6.3"
+  }
+}
